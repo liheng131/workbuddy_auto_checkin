@@ -1,6 +1,6 @@
 # workbuddy_auto_checkin
 
-WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派猫猫旅行并领回礼物**，结果推送到飞书。
+WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派猫猫旅行并领回礼物**，结果推送到群机器人（飞书 / 企业微信，按需选配）。
 
 跑在 GitHub Actions 上，按 cron 每天定时执行，不需要任何常开设备。
 
@@ -10,8 +10,8 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 > | --- | --- | --- |
 > | 适合 | 习惯 GitHub 的用户 | **不想碰 GitHub / 零命令行** 的用户 |
 > | 托管 | GitHub Actions 免费定时任务 | 金山文档智能表格脚本 + 免费定时任务 |
-> | 配置 | Fork 仓库 + 填两个 Secret | 建表格 → 粘脚本 → 填两个单元格 |
-> | 结果 | Actions 日志 / 飞书卡片 | 直接回写表格 / 飞书卡片 |
+> | 配置 | Fork 仓库 + 填 Secret | 建表格 → 粘脚本 → 填三个单元格 |
+> | 结果 | Actions 日志 / 群消息 | 直接回写表格 / 群消息 |
 >
 > 两种版本的 token 都由本机导出一次（[第 4 步](#第-4-步导出登录凭证二选一)）：
 > 装了 Python 就跑 `refresh_token.py`；没装 Python 直接下载仓库里的
@@ -23,6 +23,7 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 - **一次做两件事** — 签到与成长中心旅行在同一次运行里完成
 - **幂等** — 先查状态再决定是否领取；已签不重领，已派不重派
 - **结论解耦** — 猫猫模块任何异常都不影响签到结论；整体成败只看签到
+- **推送双通道** — 飞书与企业微信按需选配，填了哪个推哪个，两者互不影响
 - **零明文入库** — 仓库不含任何凭据；token 由本机脚本导出后写入 GitHub Secret
 
 ## 工作原理
@@ -33,6 +34,7 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 │ refresh_token.py │ ─────────────► │ Secret:            │
 │  读登录态 → 解密 │                │  WB_ACCESS_TOKEN   │
 └──────────────────┘                │  FEISHU_WEBHOOK    │
+                                    │  WECOM_WEBHOOK     │
                                     └─────────┬──────────┘
                                               │ 每天 cron
                                     ┌─────────▼──────────┐        ┌──────────────┐
@@ -42,6 +44,7 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
                                               │ webhook
                                     ┌─────────▼──────────┐
                                     │ 飞书群机器人卡片    │
+                                    │ 企业微信群消息      │
                                     └────────────────────┘
 ```
 
@@ -57,7 +60,7 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 
 - 一个 GitHub 账号
 - 一台装过 WorkBuddy **并且登录过**的电脑（只在配置时用一次）
-- 一个飞书群（自己建一个只有自己的也行），用来收消息
+- 一个用来收消息的群：飞书群或企业微信群（自己建一个只有自己的也行）
 - 电脑上有 Python 3.8+（没有也行——用仓库里的 `refresh_token.exe`，见第 4 步）
 
 ### 容易搞混的一点，先说清楚
@@ -90,11 +93,24 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 - 网页下载：你的仓库页 → 绿色 **Code** 按钮 → **Download ZIP** → 解压
 - 或用 git：`git clone https://github.com/FXmonkey/workbuddy_auto_checkin.git`
 
-### 第 3 步：拿一个飞书机器人地址
+### 第 3 步：拿一个群机器人地址
+
+飞书与企业微信**二选一**，也可以两个都拿（两个都填就两个群都收消息）。
+
+**飞书**
 
 1. 在飞书里建一个群（只有你自己也行）
 2. 群设置 → **群机器人** → **添加机器人** → **自定义机器人**
 3. 复制它给你的地址，形如 `https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx`
+
+**企业微信**
+
+1. 在企业微信里建一个群（只有你自己也行）
+2. 群设置 → **群机器人** → **添加** → **新建一个机器人**
+3. 复制它给你的地址，形如 `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=d9e48edb-fa7c-4bf9-b270-43798dda3a91`
+
+> 两者都不需要开「签名校验」：本脚本发的是不含签名的 webhook，开了会被拒绝。
+> 企业微信每个机器人每分钟最多 20 条，按日频执行远远碰不到。
 
 ### 第 4 步：导出登录凭证（二选一）
 
@@ -127,7 +143,7 @@ python refresh_token.py
 
 
 
-### 第 5 步：把两个 Secret 填进仓库
+### 第 5 步：把 Secret 填进仓库
 
 打开**你自己的仓库** → **Settings** → 左侧 **Secrets and variables** → **Actions** → 点绿色的 **New repository secret**：
 
@@ -138,19 +154,22 @@ python refresh_token.py
 | Name | Secret 里填什么 |
 | --- | --- |
 | `WB_ACCESS_TOKEN` | 第 4 步方式 B 复制的那串字符 |
-| `FEISHU_WEBHOOK` | 第 3 步拿到的飞书机器人地址 |
+| `FEISHU_WEBHOOK` | 第 3 步拿到的飞书机器人地址（不推飞书可不填） |
+| `WECOM_WEBHOOK` | 第 3 步拿到的企业微信机器人地址（不推企业微信可不填） |
 
-> 方式 A 已经自动写入 `WB_ACCESS_TOKEN` 的，这里只需要再填 `FEISHU_WEBHOOK` 一条。
-> 填完这个页面应该能看到两条记录（如上面截图所示）。
+> 方式 A 已经自动写入 `WB_ACCESS_TOKEN` 的，这里只需要再填推送用的那一条（或两条）。
+> `WB_ACCESS_TOKEN` 必填；`FEISHU_WEBHOOK` 与 `WECOM_WEBHOOK` 至少填一条才会推送，
+> 两条都填就两个群都收消息。没填的那条会在运行汇总里记成「未通知（未配置 …）」，
+> 不算推送失败；一条都没填时结果只出现在 Actions 日志与 step summary 里。
 
 ### 第 6 步：手动跑一次验证
 
 1. 打开你的仓库 → 点上方 **Actions** 页签
 2. 左侧选 **Buddy 加油站每日自动化**
 3. 右侧点 **Run workflow** 下拉，再点绿色的 **Run workflow**
-4. 等十几秒，刷新页面，飞书应该收到一条消息
+4. 等十几秒，刷新页面，你填的那个群应该收到一条消息
 
-> 这个页面显示绿色不代表签到一定成功（猫猫出问题不影响整体结论）。**以飞书收到的消息为准。**
+> 这个页面显示绿色不代表签到一定成功（猫猫出问题不影响整体结论）。**以群里收到的消息为准。**
 
 ## 配置项
 
@@ -159,7 +178,10 @@ python refresh_token.py
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `WB_ACCESS_TOKEN` | 是 | — | 访问令牌。缺失则直接退出（exit 2） |
-| `FEISHU_WEBHOOK` | 建议 | — | 飞书自定义机器人地址。缺失则不推送，仅打印日志 |
+| `FEISHU_WEBHOOK` | 建议* | — | 飞书自定义机器人地址。缺失则不推飞书 |
+| `WECOM_WEBHOOK` | 建议* | — | 企业微信群机器人地址。缺失则不推企业微信 |
+
+> *`FEISHU_WEBHOOK` 与 `WECOM_WEBHOOK` 至少填一条才会推送；两条都填则两个群都收。
 | `WB_ENDPOINT` | 否 | `https://copilot.tencent.com` | 接口地址 |
 | `WB_RESULT_FILE` | 否 | — | 写入 Markdown 汇总表，供 Actions 的 step summary 使用 |
 
@@ -199,7 +221,7 @@ python refresh_token.py
 | `1` | 签到未达成（猫猫失败不在此列） |
 | `2` | 缺少 `WB_ACCESS_TOKEN` |
 
-workflow 中脚本以 `exit 0` 收尾，只对未完成项发 `::warning::`，因此一次运行显示绿色不代表签到一定成功——**以日志、step summary 与飞书卡片为准**。
+workflow 中脚本以 `exit 0` 收尾，只对未完成项发 `::warning::`，因此一次运行显示绿色不代表签到一定成功——**以日志、step summary 与群里收到的消息为准**。
 
 ## 接口
 
@@ -240,16 +262,25 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 
 ## 常见问题
 
-**令牌过期** — token 由客户端签发，有效期约 28 天（`expiresIn` 2419200）。日志或飞书出现「认证被拒」时，本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。
+**令牌过期** — token 由客户端签发，有效期约 28 天（`expiresIn` 2419200）。日志或推送消息里出现「认证被拒」时，本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。
 
 **fork 之后 Actions 页签是空的** — fork 来的仓库默认不启用 Actions。进 Actions 页签，点页面中间的 **I understand my workflows, go ahead and enable them** 启用一次即可。
 
 **Actions 页签看不到 workflow** — 确认 `.github/workflows/daily.yml` 已入库，且仓库的 Actions 功能未被禁用。
 
-**飞书没收到卡片** — 网络异常与 5xx 会自动重试 3 次；仍失败时看日志中 `[飞书]` 行的原因：
-`19001` 表示 webhook 地址无效或复制不完整（检查 Secret `FEISHU_WEBHOOK`）；机器人若开启了
-**签名校验**，推送会被拒（重试无用），建机器人时不要勾选。当天 cron 有三个时段，某次失败
-后下一次运行会自动再推一遍当天结果（脚本幂等，不会重复领）。
+**群里没收到消息** — step summary 里「飞书推送」「企业微信推送」各占一行，先看那一行：
+
+| 现象 | 含义与处理 |
+| --- | --- |
+| `未通知（未配置 FEISHU_WEBHOOK / WECOM_WEBHOOK）` | 对应 Secret 没填，不算失败；填上即可 |
+| 飞书返回码 `19001` | 地址无效或复制不完整，检查 Secret `FEISHU_WEBHOOK` |
+| 企业微信返回码 `93000` | 地址无效或 `key` 复制不完整，检查 Secret `WECOM_WEBHOOK` |
+| 企业微信返回码 `45009` | 超过每分钟 20 条的调用限制，等一分钟即可（按日频执行碰不到） |
+| 机器人开了**签名校验** | 本脚本发的是不含签名的 webhook，会被拒且重试无用，建机器人时不要勾选 |
+
+网络异常与 5xx 会自动重试 3 次；仍失败时看日志中 `[飞书]` / `[企业微信]` 行的原始返回。
+
+当天 cron 有三个时段，某次失败后下一次运行会自动再推一遍当天结果（脚本幂等，不会重复领）。
 
 **偶发 302** — 高频轮询旅行状态时网关会短暂跳转，请求层已对 3xx 退避重试。按日频执行不会触发。
 

@@ -5,13 +5,15 @@
  *   1. 先查签到状态，未签才领取（幂等：已签不重领）；
  *   2. 猫猫先领已到家的旅行积分，再判断能否派新一趟（幂等：名额用完不重派）；
  *   3. 签到与猫猫分开汇报，猫猫失败不污染签到结论；
- *   4. 结果回写表格 + 推送飞书卡片。
+ *   4. 结果回写表格 + 推送到群机器人（飞书 / 企业微信按需选配）。
  *
  * 配置（在名为「签到自动化」的工作表里，脚本会自动创建并写表头）：
  *   B1 = WB_ACCESS_TOKEN  （必填，由本机 refresh_token.py 导出，约 28 天更新一次）
  *   B2 = FEISHU_WEBHOOK   （选填，飞书群自定义机器人地址）
  *   B3 = WB_ENDPOINT      （选填，留空即默认 https://copilot.tencent.com）
- *   B5/B6/B7/B8/B9 = 运行后自动回写：签到结论 / 猫猫结论 / 整体 / 上次运行时间 / 飞书推送
+ *   B4 = WECOM_WEBHOOK    （选填，企业微信群机器人地址）
+ *   B5/B6/B7/B8 = 运行后自动回写：签到结论 / 猫猫结论 / 整体 / 上次运行时间
+ *   B9/B10 = 运行后自动回写：飞书推送 / 企业微信推送
  *
  * 使用前提：脚本编辑器「服务」中已添加「网络 API」。
  * 兼容性：同时兼容 AirScript 2.0（ET JSAPI：Value 是方法、Value2 可写、
@@ -326,15 +328,81 @@ function runBuddy(headers, endpoint) {
   }
 }
 
-// ---------------------------------------------------------------- 飞书
+// ---------------------------------------------------------------- 推送通道
 
-/** 推送到飞书自定义机器人。返回 {ok, reason}。
+/** 把 JSON POST 到群机器人地址，再交给 judge 判定。返回 {ok, reason}。
  *
  * 重试策略与业务请求对齐：
  *   - 网络异常 / HTTP 5xx → 自动重试（最多 MAX_RETRY 次，退避），这类失败重试有用
- *   - 飞书业务拒绝（地址无效 19001、签名校验开启等）→ 不重试，重试也无用，原因写进 B9
+ *   - 业务拒绝（飞书 19001、企业微信 93000 等）→ 不重试，重试也无用，原因回写表格
  * 全部失败后，下一次定时运行会再推一遍当天结果（脚本幂等），相当于天然兜底。
  */
+function postWebhook(url, payload, tag, judge) {
+  var attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      var resp = HTTP.fetch(url, {
+        method: "POST",
+        timeout: 15000,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      var body = {};
+      try { body = resp.json(); } catch (e) { body = {}; }
+      log("  [" + tag + "] 第" + attempt + "次 HTTP " + resp.status + " " + JSON.stringify(body));
+      // 5xx 属瞬时故障，退避重试
+      if (resp.status >= 500) {
+        if (attempt < MAX_RETRY) {
+          Time.sleep(2000 * attempt);
+          continue;
+        }
+        return { ok: false, reason: "重试 " + MAX_RETRY + " 次后仍 HTTP " + resp.status };
+      }
+      if (resp.status >= 300) {
+        return { ok: false, reason: "HTTP " + resp.status };
+      }
+      return judge(body);
+    } catch (e) {
+      // 网络异常：退避重试
+      if (attempt < MAX_RETRY) {
+        log("  [" + tag + "] 请求异常，退避后重试（" + attempt + "/" + MAX_RETRY + "）：" + String(e));
+        Time.sleep(2000 * attempt);
+        continue;
+      }
+      return { ok: false, reason: "重试 " + MAX_RETRY + " 次后仍异常：" + String(e).slice(0, 100) };
+    }
+  }
+}
+
+/** 飞书自定义机器人：code === 0 才算成功。 */
+function judgeFeishu(body) {
+  if (body.code === 0) {
+    return { ok: true };
+  }
+  // 常见：19001 = webhook 地址无效或复制不完整；开启签名校验也会被拒。
+  // 这类是配置问题，重试无用，直接带原因返回，由 B9 提示用户改配置。
+  return { ok: false,
+           reason: "飞书返回码 " + (body.code === undefined ? "未知" : body.code) +
+                   "（19001 多为地址不对；机器人若开了签名校验也会失败。这是配置问题，"
+                   + "重试无用：检查 B2 地址，或建机器人时不勾选签名校验）" };
+}
+
+/** 企业微信群机器人：errcode === 0 才算成功。 */
+function judgeWecom(body) {
+  if (body.errcode === 0) {
+    return { ok: true };
+  }
+  // 常见：93000 = 地址无效或 key 复制不完整；45009 = 超过每分钟 20 条的调用限制。
+  // 这类是配置问题，重试无用，直接带原因返回，由 B10 提示用户改配置。
+  return { ok: false,
+           reason: "企业微信返回码 " + (body.errcode === undefined ? "未知" : body.errcode) +
+                   "（93000 多为地址不对或 key 复制不完整；45009 是超过每分钟 20 条的"
+                   + "调用限制；机器人若配置了签名校验也会失败。这是配置问题，"
+                   + "重试无用：检查 B4 地址）" };
+}
+
+/** 推送到飞书自定义机器人（交互卡片）。返回 {ok, reason}。 */
 function pushFeishu(webhook, title, checkinLine, buddyLine, overallOk) {
   var color = overallOk ? "green" : "red";
   var lines = [
@@ -357,49 +425,30 @@ function pushFeishu(webhook, title, checkinLine, buddyLine, overallOk) {
       elements: [{ tag: "div", text: { tag: "lark_md", content: lines.join("\n") } }]
     }
   };
-  var attempt = 0;
-  while (true) {
-    attempt++;
-    try {
-      var resp = HTTP.fetch(webhook, {
-        method: "POST",
-        timeout: 15000,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      var body = {};
-      try { body = resp.json(); } catch (e) { body = {}; }
-      log("  [飞书] 第" + attempt + "次 HTTP " + resp.status + " " + JSON.stringify(body));
-      // 5xx 属瞬时故障，退避重试
-      if (resp.status >= 500) {
-        if (attempt < MAX_RETRY) {
-          Time.sleep(2000 * attempt);
-          continue;
-        }
-        return { ok: false, reason: "重试 " + MAX_RETRY + " 次后仍 HTTP " + resp.status };
-      }
-      if (resp.status >= 300) {
-        return { ok: false, reason: "HTTP " + resp.status };
-      }
-      if (body.code === 0) {
-        return { ok: true };
-      }
-      // 常见：19001 = webhook 地址无效或复制不完整；开启签名校验也会被拒。
-      // 这类是配置问题，重试无用，直接带原因返回，由 B9 提示用户改配置。
-      return { ok: false,
-               reason: "飞书返回码 " + (body.code === undefined ? "未知" : body.code) +
-                       "（19001 多为地址不对；机器人若开了签名校验也会失败。这是配置问题，"
-                       + "重试无用：检查 B2 地址，或建机器人时不勾选签名校验）" };
-    } catch (e) {
-      // 网络异常：退避重试
-      if (attempt < MAX_RETRY) {
-        log("  [飞书] 请求异常，退避后重试（" + attempt + "/" + MAX_RETRY + "）：" + String(e));
-        Time.sleep(2000 * attempt);
-        continue;
-      }
-      return { ok: false, reason: "重试 " + MAX_RETRY + " 次后仍异常：" + String(e).slice(0, 100) };
-    }
-  }
+  return postWebhook(webhook, payload, "飞书", judgeFeishu);
+}
+
+/** 推送到企业微信群机器人（markdown 消息）。返回 {ok, reason}。
+ *
+ * 企业微信的 markdown 只支持 info（绿）/ comment（灰）/ warning（橙红）三种颜色，
+ * 没有正红，因此失败用 warning 表示；颜色标签不与其他语法嵌套，避免客户端不渲染。
+ */
+function pushWecom(webhook, title, checkinLine, buddyLine, overallOk) {
+  var color = overallOk ? "info" : "warning";
+  var head = "Buddy 加油站 · " + (overallOk ? "成功" : "部分失败");
+  var content = [
+    "<font color=\"" + color + "\">" + head + "</font>",
+    "**" + title + "**",
+    "> " + checkinLine,
+    "> " + buddyLine
+  ].join("\n");
+  var payload = { msgtype: "markdown", markdown: { content: content } };
+  return postWebhook(webhook, payload, "企业微信", judgeWecom);
+}
+
+/** 把某个通道的结果转成表格里的一句话。 */
+function formatPushResult(name, pr) {
+  return pr.ok ? "✅ 已推送到" + name : "❌ 推送到" + name + "失败：" + pr.reason;
 }
 
 // ---------------------------------------------------------------- 表格读写（1.0 / 2.0 兼容层）
@@ -501,9 +550,9 @@ function writeCell(addr, value) {
 /** 写入表头与默认值（幂等：已有内容的格子不动）。 */
 function ensureLabels() {
   var labels = {
-    A1: "WB_ACCESS_TOKEN", A2: "FEISHU_WEBHOOK", A3: "WB_ENDPOINT",
+    A1: "WB_ACCESS_TOKEN", A2: "FEISHU_WEBHOOK", A3: "WB_ENDPOINT", A4: "WECOM_WEBHOOK",
     A5: "签到结论", A6: "猫猫结论", A7: "整体", A8: "上次运行时间",
-    A9: "飞书推送"
+    A9: "飞书推送", A10: "企业微信推送"
   };
   for (var addr in labels) {
     if (Object.prototype.hasOwnProperty.call(labels, addr) && readCell(addr) === "") {
@@ -535,6 +584,7 @@ function main() {
   var token = readCell("B1");
   var webhook = readCell("B2");
   var endpoint = readCell("B3") || ENDPOINT_DEFAULT;
+  var wecomWebhook = readCell("B4");
 
   if (!token) {
     log("缺少 token：请在「" + SHEET_NAME + "」表的 B1 粘贴 refresh_token.py 导出的凭证");
@@ -576,17 +626,27 @@ function main() {
   var checkinLine = (checkinOk ? "✅ " : "❌ ") + checkin.report;
   var buddyLine = buddy.report ? "🐱 " + buddy.report : "🐱 无结论";
 
-  // 推送结果也回写表格：业务结论（B5-B7）与推送状态（B9）分开，
-  // 避免「表格显示成功但飞书没消息」时无从排查。
-  // 推送失败的兜底：瞬时故障已自动重试；配置类失败改好 B2 后手动跑一次即可；
+  // 推送结果也回写表格：业务结论（B5-B7）与推送状态（B9/B10）分开，
+  // 避免「表格显示成功但群里没消息」时无从排查。
+  // 推送失败的兜底：瞬时故障已自动重试；配置类失败改好 B2 / B4 后手动跑一次即可；
   // 若当天建了多个定时时间点，下一次运行会自动再推一遍当天结果。
-  var pushLine;
+  // 两个通道按需选配，各自独立推送：一边失败不影响另一边。
+  var feishuLine;
   if (webhook) {
-    var pr = pushFeishu(webhook, "每日自动化", checkinLine, buddyLine, overallOk);
-    pushLine = pr.ok ? "✅ 已推送到飞书" : "❌ 推送失败：" + pr.reason;
+    feishuLine = formatPushResult("飞书",
+      pushFeishu(webhook, "每日自动化", checkinLine, buddyLine, overallOk));
   } else {
-    log("  （B2 未填飞书 webhook，跳过推送）");
-    pushLine = "未配置：B2 没填飞书地址，本次不推送";
+    log("  （B2 未填飞书 webhook，未通知）");
+    feishuLine = "未通知（未配置 B2 飞书 webhook）";
+  }
+
+  var wecomLine;
+  if (wecomWebhook) {
+    wecomLine = formatPushResult("企业微信",
+      pushWecom(wecomWebhook, "每日自动化", checkinLine, buddyLine, overallOk));
+  } else {
+    log("  （B4 未填企业微信 webhook，未通知）");
+    wecomLine = "未通知（未配置 B4 企业微信 webhook）";
   }
 
   // 结果回写表格
@@ -594,11 +654,13 @@ function main() {
   writeCell("B6", buddyLine);
   writeCell("B7", overallOk ? "成功（签到已达成）" : "失败（签到未达成）");
   writeCell("B8", nowBeijing());
-  writeCell("B9", pushLine);
+  writeCell("B9", feishuLine);
+  writeCell("B10", wecomLine);
 
   log("=== 完成：" + (overallOk ? "成功" : "失败") + " ===");
   log("  签到：" + checkinLine);
   log("  猫猫：" + buddyLine);
+  log("  推送：" + feishuLine + " ｜ " + wecomLine);
 }
 
 main();

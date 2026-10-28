@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推飞书。
+"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推送到群机器人。
 
 设计要点：
   1. 一次运行把签到与派猫都做掉；
   2. 先领已到家的旅行积分，再判断能否派新一趟；今日名额已用则不派；
   3. 签到与猫猫状态分开汇报；
-  4. 猫猫失败不污染签到结论 —— 签到成功即整体成功。
+  4. 猫猫失败不污染签到结论 —— 签到成功即整体成功；
+  5. 推送通道按需选配（飞书 / 企业微信），配了几条推几条，互不影响。
 
 凭证来自 GitHub Secret（由本机 refresh_token.py 注入），只读环境变量，不落盘、不打日志。
 """
@@ -292,17 +293,71 @@ def run_buddy(headers, endpoint):
         return {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e), "notes": notes}
 
 
-# ---------------------------------------------------------------- 飞书
+# ---------------------------------------------------------------- 推送通道
 
-def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
-    """推送到飞书自定义机器人。返回 (ok, reason)。
+def _post_webhook(url, payload, tag, judge):
+    """把 JSON POST 到群机器人地址，并交给 judge 判定成败。返回 (ok, reason)。
 
     重试策略与业务请求、WPS 版保持一致：
       - 网络异常 / HTTP 5xx → 自动重试（最多 MAX_RETRY 次，退避），瞬时故障自愈
-      - 飞书业务拒绝（19001 地址无效、机器人开启签名校验等）→ 不重试（重试无用），
+      - 业务拒绝（飞书 19001、企业微信 93000 等）→ 不重试（重试无用），
         原因带改法返回，写入结果供 step summary 展示
     兜底：脚本幂等，当天 cron 有多个时段时，下一次运行会自动再推一遍当天结果。
     """
+    data = json.dumps(payload).encode("utf-8")
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            req = urllib.request.Request(url, data=data, method="POST",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15,
+                                        context=ssl.create_default_context()) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return False, "%s 返回非 JSON（%s）" % (tag, raw[:80])
+                log("  [%s] HTTP %s %s" % (tag, resp.status, json.dumps(body, ensure_ascii=False)))
+                return judge(body)
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 and attempt < MAX_RETRY:
+                log("  [%s] HTTP %s，退避后重试（%d/%d）" % (tag, e.code, attempt, MAX_RETRY))
+                time.sleep(2.0 * attempt)
+                continue
+            if e.code >= 500:
+                return False, "重试 %d 次后仍 HTTP %s" % (MAX_RETRY, e.code)
+            return False, "HTTP %s" % e.code
+        except Exception as e:
+            if attempt < MAX_RETRY:
+                log("  [%s] 请求异常，退避后重试（%d/%d）：%s: %s"
+                    % (tag, attempt, MAX_RETRY, type(e).__name__, e))
+                time.sleep(2.0 * attempt)
+                continue
+            return False, "重试 %d 次后仍异常：%s: %s" % (MAX_RETRY, type(e).__name__, e)
+
+
+def _judge_feishu(body):
+    """飞书自定义机器人：code == 0 才算成功。"""
+    if body.get("code") == 0:
+        return True, ""
+    return False, ("飞书返回码 %s（19001 多为地址不对；机器人若开了签名校验也会失败。"
+                   "这是配置问题，重试无用：检查 Secret FEISHU_WEBHOOK，或建机器人时"
+                   "不要勾选签名校验）" % body.get("code", "未知"))
+
+
+def _judge_wecom(body):
+    """企业微信群机器人：errcode == 0 才算成功。"""
+    code = body.get("errcode")
+    if code == 0:
+        return True, ""
+    return False, ("企业微信返回码 %s（93000 多为地址不对或 key 复制不完整；45009 是超过"
+                   "每分钟 20 条的调用限制；机器人若配置了签名校验也会失败。这是配置问题，"
+                   "重试无用：检查 Secret WECOM_WEBHOOK）" % (code if code is not None else "未知"))
+
+
+def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
+    """推送到飞书自定义机器人（交互卡片）。返回 (ok, reason)。"""
     color = "green" if overall_ok else "red"
     lines = [
         "**%s**" % title,
@@ -325,50 +380,63 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
             "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}],
         },
     }
-    data = json.dumps(payload).encode("utf-8")
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            req = urllib.request.Request(webhook, data=data, method="POST",
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
-                body = json.loads(resp.read().decode("utf-8", "replace"))
-                log("  [飞书] HTTP %s %s" % (resp.status, json.dumps(body, ensure_ascii=False)))
-                if body.get("code") == 0:
-                    return True, ""
-                return False, ("飞书返回码 %s（19001 多为地址不对；机器人若开了签名校验也会失败。"
-                               "这是配置问题，重试无用：检查 Secret FEISHU_WEBHOOK，或建机器人时"
-                               "不要勾选签名校验）" % body.get("code", "未知"))
-        except urllib.error.HTTPError as e:
-            if e.code >= 500 and attempt < MAX_RETRY:
-                log("  [飞书] HTTP %s，退避后重试（%d/%d）" % (e.code, attempt, MAX_RETRY))
-                time.sleep(2.0 * attempt)
-                continue
-            if e.code >= 500:
-                return False, "重试 %d 次后仍 HTTP %s" % (MAX_RETRY, e.code)
-            return False, "HTTP %s" % e.code
-        except Exception as e:
-            if attempt < MAX_RETRY:
-                log("  [飞书] 请求异常，退避后重试（%d/%d）：%s: %s"
-                    % (attempt, MAX_RETRY, type(e).__name__, e))
-                time.sleep(2.0 * attempt)
-                continue
-            return False, "重试 %d 次后仍异常：%s: %s" % (MAX_RETRY, type(e).__name__, e)
+    return _post_webhook(webhook, payload, "飞书", _judge_feishu)
+
+
+def push_wecom(webhook, title, checkin_line, buddy_line, overall_ok):
+    """推送到企业微信群机器人（markdown 消息）。返回 (ok, reason)。
+
+    企业微信的 markdown 只支持 info（绿）/ comment（灰）/ warning（橙红）三种颜色，
+    没有正红，因此失败用 warning 表示；颜色标签不与其他语法嵌套，避免客户端不渲染。
+    """
+    color = "info" if overall_ok else "warning"
+    head = "Buddy 加油站 · %s" % ("成功" if overall_ok else "部分失败")
+    content = "\n".join([
+        "<font color=\"%s\">%s</font>" % (color, head),
+        "**%s**" % title,
+        "> %s" % checkin_line,
+        "> %s" % buddy_line,
+    ])
+    payload = {"msgtype": "markdown", "markdown": {"content": content}}
+    return _post_webhook(webhook, payload, "企业微信", _judge_wecom)
+
+
+def summarize_push(results):
+    """把各通道结果汇总为 (ok, reason)。results 形如 [(通道名, ok, reason)]。
+
+    无通道配置时 ok 为 None —— 这是「未通知」，与「推送失败」区分开；
+    任一通道失败则整体记失败，原因逐个拼接，便于一次看清该改哪个配置。
+    """
+    if not results:
+        return None, "未配置推送通道（未通知）"
+    ok = all(item[1] for item in results)
+    reasons = ["%s：%s" % (name, reason) for name, item_ok, reason in results if not item_ok]
+    return ok, "；".join(reasons)
+
+
+def push_text(ok, reason):
+    """单个通道在汇总表里的一句话。"""
+    return "✅ 已推送" if ok else "❌ 推送失败：%s" % reason
+
+
+def not_configured_text(env_name):
+    """未配置时的文案：说明没推送，但不记成失败。"""
+    return "未通知（未配置 %s）" % env_name
 
 
 # ---------------------------------------------------------------- 主流程
 
 def main():
     token = os.environ.get("WB_ACCESS_TOKEN")
-    webhook = os.environ.get("FEISHU_WEBHOOK")
+    feishu_webhook = os.environ.get("FEISHU_WEBHOOK")
+    wecom_webhook = os.environ.get("WECOM_WEBHOOK")
     endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
 
     if not token:
         log("缺少环境变量 WB_ACCESS_TOKEN（请在本机运行 refresh_token.py 注入 GitHub Secret）")
         return 2
-    if not webhook:
-        log("缺少环境变量 FEISHU_WEBHOOK")
+    if not feishu_webhook and not wecom_webhook:
+        log("未配置 FEISHU_WEBHOOK / WECOM_WEBHOOK，本次只打印结果、不推送")
 
     headers = {
         "Accept": "application/json",
@@ -394,15 +462,30 @@ def main():
     checkin_line = ("✅ " if checkin_ok else "❌ ") + checkin["report"]
     buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
 
-    # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论
-    push_ok, push_reason = None, "未配置（缺少 FEISHU_WEBHOOK，本次不推送）"
-    if webhook:
-        push_ok, push_reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
+    # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论。
+    # 每个通道独立推送、独立汇报：一个失败不影响另一个；没配的写「未通知」，不记成失败。
+    channels = [
+        ("飞书", "FEISHU_WEBHOOK", feishu_webhook, push_feishu),
+        ("企业微信", "WECOM_WEBHOOK", wecom_webhook, push_wecom),
+    ]
+    push_results, push_rows, push_records = [], [], []
+    for name, env_name, url, send in channels:
+        if not url:
+            log("  %s未配置（缺 %s），本次不推送" % (name, env_name))
+            push_records.append({"name": name, "ok": None,
+                                 "reason": "未配置 %s（未通知）" % env_name})
+            push_rows.append(("%s推送" % name, not_configured_text(env_name)))
+            continue
+        ok, reason = send(url, "每日自动化", checkin_line, buddy_line, overall_ok)
+        push_results.append((name, ok, reason))
+        push_records.append({"name": name, "ok": ok, "reason": reason})
+        push_rows.append(("%s推送" % name, push_text(ok, reason)))
+    push_ok, push_reason = summarize_push(push_results)
 
     result = {
         "checkin": {"ok": checkin_ok, **checkin},
         "buddy": {k: v for k, v in buddy.items() if k != "notes"},
-        "push": {"ok": push_ok, "reason": push_reason},
+        "push": {"ok": push_ok, "reason": push_reason, "channels": push_records},
         "overall_ok": overall_ok,
     }
     print("RESULT_JSON " + json.dumps(result, ensure_ascii=False))
@@ -411,13 +494,12 @@ def main():
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
-            push_line = ("✅ 已推送到飞书" if push_ok
-                         else "❌ 推送失败：%s" % push_reason)
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
                 f.write("| 签到 | %s |\n" % checkin_line)
                 f.write("| 猫猫旅行 | %s |\n" % buddy_line)
-                f.write("| 飞书推送 | %s |\n" % push_line)
+                for label, text in push_rows:
+                    f.write("| %s | %s |\n" % (label, text))
                 f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok else "失败（签到未达成）"))
         except OSError as e:
             log("结果文件写入失败：%s" % e)
