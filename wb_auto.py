@@ -7,13 +7,16 @@
   2. 先领已到家的旅行积分，再判断能否派新一趟；今日名额已用则不派；
   3. 签到与猫猫状态分开汇报；
   4. 猫猫失败不污染签到结论 —— 签到成功即整体成功；
-  5. 推送通道按需选配（飞书 / 企业微信），配了几条推几条，互不影响。
+  5. 推送通道按需选配（飞书 / 企业微信），配了几条推几条，互不影响；
+  6. WB_ACCESS_TOKEN 可放多条 token（换行 / 逗号分隔，可写「名字:token」），
+     逐个账号签到后合并成一条消息推送。
 
 凭证来自 GitHub Secret（由本机 refresh_token.py 注入），只读环境变量，不落盘、不打日志。
 """
 
 import json
 import os
+import re
 import ssl
 import sys
 import time
@@ -356,47 +359,63 @@ def _judge_wecom(body):
                    "重试无用：检查 Secret WECOM_WEBHOOK）" % (code if code is not None else "未知"))
 
 
-def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
-    """推送到飞书自定义机器人（交互卡片）。返回 (ok, reason)。"""
-    color = "green" if overall_ok else "red"
-    lines = [
-        "**%s**" % title,
-        "",
-        "**签到**",
-        checkin_line,
-        "",
-        "**猫猫旅行**",
-        buddy_line,
-    ]
+def build_head(report, overall_ok):
+    """卡片标题：单账号写成败，多账号写「几分之几」。"""
+    if len(report) == 1:
+        return "Buddy 加油站 · %s" % ("成功" if overall_ok else "部分失败")
+    ok_n = sum(1 for item in report if item["ok"])
+    return "Buddy 加油站 · %d/%d 账号签到成功" % (ok_n, len(report))
+
+
+def build_lines(title, report):
+    """卡片正文：单账号按「签到 / 猫猫旅行」分节，多账号按账号分块。"""
+    lines = ["**%s**" % title, ""]
+    if len(report) == 1:
+        lines += ["**签到**", report[0]["checkin_line"], "",
+                  "**猫猫旅行**", report[0]["buddy_line"]]
+        return lines
+    for item in report:
+        if lines[-1] != "":
+            lines.append("")
+        lines.append("**%s**" % item["label"])
+        lines.append(item["checkin_line"])
+        lines.append(item["buddy_line"])
+    return lines
+
+
+def push_feishu(webhook, title, report, overall_ok):
+    """推送到飞书自定义机器人（交互卡片）。返回 (ok, reason)。
+
+    report 形如 [{"label", "ok", "checkin_line", "buddy_line"}]，一个或多个账号。
+    """
     payload = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "template": color,
-                "title": {"tag": "plain_text",
-                          "content": "Buddy 加油站 · %s" % ("成功" if overall_ok else "部分失败")},
+                "template": "green" if overall_ok else "red",
+                "title": {"tag": "plain_text", "content": build_head(report, overall_ok)},
             },
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}],
+            "elements": [{"tag": "div",
+                          "text": {"tag": "lark_md",
+                                   "content": "\n".join(build_lines(title, report))}}],
         },
     }
     return _post_webhook(webhook, payload, "飞书", _judge_feishu)
 
 
-def push_wecom(webhook, title, checkin_line, buddy_line, overall_ok):
+def push_wecom(webhook, title, report, overall_ok):
     """推送到企业微信群机器人（markdown 消息）。返回 (ok, reason)。
 
     企业微信的 markdown 只支持 info（绿）/ comment（灰）/ warning（橙红）三种颜色，
     没有正红，因此失败用 warning 表示；颜色标签不与其他语法嵌套，避免客户端不渲染。
     """
     color = "info" if overall_ok else "warning"
-    head = "Buddy 加油站 · %s" % ("成功" if overall_ok else "部分失败")
-    content = "\n".join([
-        "<font color=\"%s\">%s</font>" % (color, head),
-        "**%s**" % title,
-        "> %s" % checkin_line,
-        "> %s" % buddy_line,
-    ])
+    body = []
+    for line in build_lines(title, report):
+        body.append(line if (not line or line.startswith("**")) else "> " + line)
+    content = "\n".join(["<font color=\"%s\">%s</font>" % (color, build_head(report, overall_ok))]
+                        + body)
     payload = {"msgtype": "markdown", "markdown": {"content": content}}
     return _post_webhook(webhook, payload, "企业微信", _judge_wecom)
 
@@ -426,41 +445,84 @@ def not_configured_text(env_name):
 
 # ---------------------------------------------------------------- 主流程
 
-def main():
-    token = os.environ.get("WB_ACCESS_TOKEN")
-    feishu_webhook = os.environ.get("FEISHU_WEBHOOK")
-    wecom_webhook = os.environ.get("WECOM_WEBHOOK")
-    endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
+def parse_tokens(raw):
+    """解析 WB_ACCESS_TOKEN，支持一条或多条。返回 [(label, token)]。
 
-    if not token:
-        log("缺少环境变量 WB_ACCESS_TOKEN（请在本机运行 refresh_token.py 注入 GitHub Secret）")
-        return 2
-    if not feishu_webhook and not wecom_webhook:
-        log("未配置 FEISHU_WEBHOOK / WECOM_WEBHOOK，本次只打印结果、不推送")
+    多条用换行 / 逗号 / 分号分隔，每条可写「名字:token」给账号起个名；
+    token 的字符集是 A-Za-z0-9._~+/- 加尾部 =，不含这些分隔符与冒号，故可安全切分。
+    没写名字的用 token 尾 4 位做指纹当标签；重复 token 只保留一条。
+    """
+    accounts, seen = [], set()
+    for chunk in re.split(r"[\n,;]+", raw or ""):
+        item = chunk.strip()
+        if not item:
+            continue
+        label, sep, token = item.partition(":")
+        if not sep:
+            label, token = "", item
+        token = token.strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        accounts.append((label.strip() or "账号(%s)" % token[-4:], token))
+    return accounts
 
+
+def run_account(label, token, endpoint):
+    """跑一个账号的签到与猫猫。返回 {label, ok, checkin, buddy, checkin_line, buddy_line}。"""
     headers = {
         "Accept": "application/json",
         "Authorization": "Bearer %s" % token,
         "Content-Type": "application/json",
         "User-Agent": "WorkBuddy",
     }
-
-    log("=== 1/2 签到 ===")
-    checkin_ok, checkin = run_checkin(headers, endpoint)
-    log("  结论：%s" % checkin["report"])
+    try:
+        checkin_ok, checkin = run_checkin(headers, endpoint)
+    except Exception as e:
+        checkin_ok, checkin = False, {"result": "ERROR",
+                                      "report": "签到模块异常（%s: %s）" % (type(e).__name__, e)}
+    log("    签到：%s" % checkin["report"])
 
     # 猫猫独立 try：任何异常都不影响签到结论
-    log("=== 2/2 猫猫旅行 ===")
     try:
         buddy = run_buddy(headers, endpoint)
     except Exception as e:
         buddy = {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e)}
-    log("  结论：%s" % buddy.get("report", ""))
+    log("    猫猫：%s" % buddy.get("report", ""))
 
-    # 整体成败只看签到：签到成功即成功
-    overall_ok = checkin_ok
-    checkin_line = ("✅ " if checkin_ok else "❌ ") + checkin["report"]
-    buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
+    return {
+        "label": label,
+        "ok": checkin_ok,
+        "checkin": checkin,
+        "buddy": buddy,
+        "checkin_line": ("✅ " if checkin_ok else "❌ ") + checkin["report"],
+        "buddy_line": ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论",
+    }
+
+
+def main():
+    accounts = parse_tokens(os.environ.get("WB_ACCESS_TOKEN"))
+    feishu_webhook = os.environ.get("FEISHU_WEBHOOK")
+    wecom_webhook = os.environ.get("WECOM_WEBHOOK")
+    endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
+
+    if not accounts:
+        log("缺少环境变量 WB_ACCESS_TOKEN（请在本机运行 refresh_token.py 注入 GitHub Secret）")
+        return 2
+    if not feishu_webhook and not wecom_webhook:
+        log("未配置 FEISHU_WEBHOOK / WECOM_WEBHOOK，本次只打印结果、不推送")
+
+    # 逐个账号跑：某个账号异常不影响其它账号，各自独立记结论
+    results = []
+    for idx, (label, token) in enumerate(accounts, 1):
+        log("=== 账号 %d/%d：%s ===" % (idx, len(accounts), label))
+        results.append(run_account(label, token, endpoint))
+
+    # 整体成败只看签到；多账号时要求每个账号的签到都达成
+    overall_ok = all(item["ok"] for item in results)
+    report = [{"label": item["label"], "ok": item["ok"],
+               "checkin_line": item["checkin_line"], "buddy_line": item["buddy_line"]}
+              for item in results]
 
     # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论。
     # 每个通道独立推送、独立汇报：一个失败不影响另一个；没配的写「未通知」，不记成失败。
@@ -476,31 +538,41 @@ def main():
                                  "reason": "未配置 %s（未通知）" % env_name})
             push_rows.append(("%s推送" % name, not_configured_text(env_name)))
             continue
-        ok, reason = send(url, "每日自动化", checkin_line, buddy_line, overall_ok)
+        ok, reason = send(url, "每日自动化", report, overall_ok)
         push_results.append((name, ok, reason))
         push_records.append({"name": name, "ok": ok, "reason": reason})
         push_rows.append(("%s推送" % name, push_text(ok, reason)))
     push_ok, push_reason = summarize_push(push_results)
 
     result = {
-        "checkin": {"ok": checkin_ok, **checkin},
-        "buddy": {k: v for k, v in buddy.items() if k != "notes"},
+        "accounts": [{"label": item["label"], "ok": item["ok"],
+                      "checkin": {"ok": item["ok"], **item["checkin"]},
+                      "buddy": {k: v for k, v in item["buddy"].items() if k != "notes"}}
+                     for item in results],
         "push": {"ok": push_ok, "reason": push_reason, "channels": push_records},
         "overall_ok": overall_ok,
     }
     print("RESULT_JSON " + json.dumps(result, ensure_ascii=False))
 
     # 结果文件只含结论文案，不含 token，供 Actions 写入 step summary
+    ok_n = sum(1 for item in results if item["ok"])
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
-                f.write("| 签到 | %s |\n" % checkin_line)
-                f.write("| 猫猫旅行 | %s |\n" % buddy_line)
+                if len(results) == 1:
+                    f.write("| 签到 | %s |\n" % results[0]["checkin_line"])
+                    f.write("| 猫猫旅行 | %s |\n" % results[0]["buddy_line"])
+                else:
+                    for item in results:
+                        f.write("| %s | %s<br>%s |\n"
+                                % (item["label"], item["checkin_line"], item["buddy_line"]))
                 for label, text in push_rows:
                     f.write("| %s | %s |\n" % (label, text))
-                f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok else "失败（签到未达成）"))
+                f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok
+                                             else "失败（签到未达成）" if len(results) == 1
+                                             else "%d/%d 账号签到达成" % (ok_n, len(results))))
         except OSError as e:
             log("结果文件写入失败：%s" % e)
 

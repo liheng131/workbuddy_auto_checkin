@@ -24,6 +24,7 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 - **幂等** — 先查状态再决定是否领取；已签不重领，已派不重派
 - **结论解耦** — 猫猫模块任何异常都不影响签到结论；整体成败只看签到
 - **推送双通道** — 飞书与企业微信按需选配，填了哪个推哪个，两者互不影响
+- **多账号** — 一个 Secret 里可放多条 token，逐个签到后合并成一条消息
 - **零明文入库** — 仓库不含任何凭据；token 由本机脚本导出后写入 GitHub Secret
 
 ## 工作原理
@@ -153,7 +154,7 @@ python refresh_token.py
 
 | Name | Secret 里填什么 |
 | --- | --- |
-| `WB_ACCESS_TOKEN` | 第 4 步方式 B 复制的那串字符 |
+| `WB_ACCESS_TOKEN` | 第 4 步方式 B 复制的那串字符（要签多个账号见下节） |
 | `FEISHU_WEBHOOK` | 第 3 步拿到的飞书机器人地址（不推飞书可不填） |
 | `WECOM_WEBHOOK` | 第 3 步拿到的企业微信机器人地址（不推企业微信可不填） |
 
@@ -161,6 +162,22 @@ python refresh_token.py
 > `WB_ACCESS_TOKEN` 必填；`FEISHU_WEBHOOK` 与 `WECOM_WEBHOOK` 至少填一条才会推送，
 > 两条都填就两个群都收消息。没填的那条会在运行汇总里记成「未通知（未配置 …）」，
 > 不算推送失败；一条都没填时结果只出现在 Actions 日志与 step summary 里。
+
+### 多个账号一起签（可选）
+
+`WB_ACCESS_TOKEN` 里可以放**多条** token，换行、逗号、分号分隔都行，建议给每条起个名字：
+
+```text
+张三:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc
+李四:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIyIn0.def
+```
+
+- 冒号后面那串才是 token；**不写名字**的会用 token 末 4 位当标签（如 `账号(a1b2)`）
+- token 必须由各人**在自己电脑上**跑一次 `refresh_token.py` 导出——解密密钥绑在本机客户端，
+  拿不到别人的登录态就导不出他的 token
+- 所有账号跑完后**合并成一条消息**推送，卡片标题写「2/3 账号签到成功」，每个账号一块
+- 某个账号 401/403 只影响它自己那块，其它账号照常跑
+- 只签一个账号的话写法跟以前完全一样，直接贴一串即可，不用加名字
 
 ### 第 6 步：手动跑一次验证
 
@@ -177,13 +194,13 @@ python refresh_token.py
 
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `WB_ACCESS_TOKEN` | 是 | — | 访问令牌。缺失则直接退出（exit 2） |
+| `WB_ACCESS_TOKEN` | 是 | — | 访问令牌，**可放多条**（换行 / 逗号 / 分号分隔，可写 `名字:token`）。缺失则直接退出（exit 2） |
 | `FEISHU_WEBHOOK` | 建议* | — | 飞书自定义机器人地址。缺失则不推飞书 |
 | `WECOM_WEBHOOK` | 建议* | — | 企业微信群机器人地址。缺失则不推企业微信 |
-
-> *`FEISHU_WEBHOOK` 与 `WECOM_WEBHOOK` 至少填一条才会推送；两条都填则两个群都收。
 | `WB_ENDPOINT` | 否 | `https://copilot.tencent.com` | 接口地址 |
 | `WB_RESULT_FILE` | 否 | — | 写入 Markdown 汇总表，供 Actions 的 step summary 使用 |
+
+> *`FEISHU_WEBHOOK` 与 `WECOM_WEBHOOK` 至少填一条才会推送；两条都填则两个群都收。
 
 ### 本机侧（`refresh_token.py`）
 
@@ -218,7 +235,7 @@ python refresh_token.py
 | 码 | 含义 |
 | --- | --- |
 | `0` | 签到成功 |
-| `1` | 签到未达成（猫猫失败不在此列） |
+| `1` | 签到未达成（多账号时任一账号未达成；猫猫失败不在此列） |
 | `2` | 缺少 `WB_ACCESS_TOKEN` |
 
 workflow 中脚本以 `exit 0` 收尾，只对未完成项发 `::warning::`，因此一次运行显示绿色不代表签到一定成功——**以日志、step summary 与群里收到的消息为准**。
@@ -263,6 +280,9 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 ## 常见问题
 
 **令牌过期** — token 由客户端签发，有效期约 28 天（`expiresIn` 2419200）。日志或推送消息里出现「认证被拒」时，本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。
+
+> 多账号时 `--gh-repo` 会**覆盖**整个 `WB_ACCESS_TOKEN`，只留下刚导出的那一条。
+> 所以多人共用时改成手动粘贴：把新 token 替换 Secret 里对应的那一行即可，别用 `--gh-repo` 覆盖。
 
 **fork 之后 Actions 页签是空的** — fork 来的仓库默认不启用 Actions。进 Actions 页签，点页面中间的 **I understand my workflows, go ahead and enable them** 启用一次即可。
 
