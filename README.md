@@ -165,14 +165,15 @@ python refresh_token.py
 
 ### 多个账号一起签（可选）
 
-`WB_ACCESS_TOKEN` 里可以放**多条** token，换行、逗号、分号分隔都行，建议给每条起个名字：
+`WB_ACCESS_TOKEN` 里可以放**多条** token。换行、逗号、分号都行，**中英文标点都认**，可以混着写：
 
 ```text
 张三:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc
-李四:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIyIn0.def
+李四：eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIyIn0.def
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIzIn0.ghi
 ```
 
-- 冒号后面那串才是 token；**不写名字**的会用 token 末 4 位当标签（如 `账号(a1b2)`）
+- 名字**可写可不写**，冒号中英文都认；不写名字的用 token 末 4 位当标签（如 `账号(a1b2)`）
 - token 必须由各人**在自己电脑上**跑一次 `refresh_token.py` 导出——解密密钥绑在本机客户端，
   拿不到别人的登录态就导不出他的 token
 - 所有账号跑完后**合并成一条消息**推送，卡片标题写「2/3 账号签到成功」，每个账号一块

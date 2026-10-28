@@ -448,17 +448,20 @@ def not_configured_text(env_name):
 def parse_tokens(raw):
     """解析 WB_ACCESS_TOKEN，支持一条或多条。返回 [(label, token)]。
 
-    多条用换行 / 逗号 / 分号分隔，每条可写「名字:token」给账号起个名；
-    token 的字符集是 A-Za-z0-9._~+/- 加尾部 =，不含这些分隔符与冒号，故可安全切分。
-    没写名字的用 token 尾 4 位做指纹当标签；重复 token 只保留一条。
+    多条之间用换行 / 逗号 / 分号分隔（中英文标点都认），每条可写「名字:token」给账号起个名
+    （冒号同样中英文都认）。token 的字符集是 A-Za-z0-9._~+/- 加尾部 =，不含这些分隔符
+    与冒号，故可安全切分；名字可以留空，不写就用 token 尾 4 位做指纹当标签。
+    重复 token 只保留一条。
     """
     accounts, seen = [], set()
-    for chunk in re.split(r"[\n,;]+", raw or ""):
+    for chunk in re.split(r"[\n,;；，]+", raw or ""):
         item = chunk.strip()
         if not item:
             continue
-        label, sep, token = item.partition(":")
-        if not sep:
+        parts = re.split(r"[:：]", item, maxsplit=1)
+        if len(parts) == 2 and parts[1].strip():
+            label, token = parts[0], parts[1]
+        else:
             label, token = "", item
         token = token.strip()
         if not token or token in seen:
