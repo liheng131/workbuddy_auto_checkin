@@ -14,6 +14,7 @@
 凭证来自 GitHub Secret（由本机 refresh_token.py 注入），只读环境变量，不落盘、不打日志。
 """
 
+import base64
 import json
 import os
 import re
@@ -22,10 +23,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 REQUEST_TIMEOUT = 20
 MAX_RETRY = 3
+
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 CODE_NO_NETWORK = -1
 
@@ -377,7 +381,7 @@ def build_lines(title, report):
     for item in report:
         if lines[-1] != "":
             lines.append("")
-        lines.append("**%s**" % item["label"])
+        lines.append("**%s**" % (item["label"] + expiry_label(item.get("expiry"))))
         lines.append(item["checkin_line"])
         lines.append(item["buddy_line"])
     return lines
@@ -471,8 +475,47 @@ def parse_tokens(raw):
     return accounts
 
 
+def token_expiry(token):
+    """从 token（JWT）的 payload 里取到期时间（北京时间）。取不到返回 None。
+
+    只解 base64url 的 payload 段，不校验签名 —— 这里只需要「什么时候过期」，
+    真伪由服务端判定，解不出来就当没有（不显示括号，不影响签到）。
+    """
+    segs = token.split(".")
+    if len(segs) != 3:
+        return None
+    try:
+        pad = segs[1] + "=" * (-len(segs[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(pad.encode()).decode("utf-8"))
+        exp = int(payload.get("exp") or 0)
+    except Exception:
+        return None
+    if exp <= 0:
+        return None
+    return datetime.fromtimestamp(exp, tz=BEIJING_TZ)
+
+
+def expiry_label(exp):
+    """把到期时间写成「（至 11-28）」；已过期或只剩几天时给更醒目的说法。"""
+    if exp is None:
+        return ""
+    now = datetime.now(BEIJING_TZ)
+    if exp <= now:
+        return "（已于 %s 过期）" % exp.strftime("%m-%d")
+    stamp = exp.strftime("%Y-%m-%d") if exp.year != now.year else exp.strftime("%m-%d")
+    days = (exp.date() - now.date()).days
+    if days <= 3:
+        return "（至 %s，仅剩 %d 天）" % (stamp, days)
+    return "（至 %s）" % stamp
+
+
 def run_account(label, token, endpoint):
-    """跑一个账号的签到与猫猫。返回 {label, ok, checkin, buddy, checkin_line, buddy_line}。"""
+    """跑一个账号的签到与猫猫。
+
+    返回 {label, ok, expiry, checkin, buddy, checkin_line, buddy_line}。
+    """
+    expiry = token_expiry(token)
+    log("    有效期%s" % (expiry_label(expiry).strip("（）") or "未知"))
     headers = {
         "Accept": "application/json",
         "Authorization": "Bearer %s" % token,
@@ -496,6 +539,7 @@ def run_account(label, token, endpoint):
     return {
         "label": label,
         "ok": checkin_ok,
+        "expiry": expiry,
         "checkin": checkin,
         "buddy": buddy,
         "checkin_line": ("✅ " if checkin_ok else "❌ ") + checkin["report"],
@@ -523,7 +567,7 @@ def main():
 
     # 整体成败只看签到；多账号时要求每个账号的签到都达成
     overall_ok = all(item["ok"] for item in results)
-    report = [{"label": item["label"], "ok": item["ok"],
+    report = [{"label": item["label"], "ok": item["ok"], "expiry": item["expiry"],
                "checkin_line": item["checkin_line"], "buddy_line": item["buddy_line"]}
               for item in results]
 
@@ -549,6 +593,7 @@ def main():
 
     result = {
         "accounts": [{"label": item["label"], "ok": item["ok"],
+                      "expiry": item["expiry"].isoformat() if item["expiry"] else None,
                       "checkin": {"ok": item["ok"], **item["checkin"]},
                       "buddy": {k: v for k, v in item["buddy"].items() if k != "notes"}}
                      for item in results],
@@ -570,7 +615,8 @@ def main():
                 else:
                     for item in results:
                         f.write("| %s | %s<br>%s |\n"
-                                % (item["label"], item["checkin_line"], item["buddy_line"]))
+                                % (item["label"] + expiry_label(item["expiry"]),
+                                   item["checkin_line"], item["buddy_line"]))
                 for label, text in push_rows:
                     f.write("| %s | %s |\n" % (label, text))
                 f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok
