@@ -69,11 +69,18 @@ jobs:
         if: always()
         env:
           RESULT_FILE: ${{ runner.temp }}/wb_result.json
+          EVENT_NAME: ${{ github.event_name }}
+          # schedule 触发时这里是命中的那条 cron（如 "10 17 * * *"），手动触发为空
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          RUN_STARTED: ${{ github.run_started_at }}
         run: |
           set -uo pipefail
           {
             echo "### Buddy 加油站每日自动化"
             echo ""
+            # 计划时点与实际执行时刻都写出来，便于判断是不是 GitHub 排队延迟
+            echo "- 触发方式：${EVENT_NAME}${EVENT_SCHEDULE:+（计划 cron: ${EVENT_SCHEDULE}）}"
+            echo "- 开始时间：${RUN_STARTED}"
             echo "- 运行时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')（cron 为 UTC）"
             # 空行不能省：Markdown 表格必须和上一行隔开，否则会当普通文本渲染
             echo ""
